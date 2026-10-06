@@ -190,27 +190,29 @@ class TestFallbackTransport:
         calls = []
         behavior = {
             "api.telegram.org": "timeout",
-            "149.154.167.220": "ok",
             "149.154.167.221": "ok",
+            "149.154.167.222": "ok",
         }
         monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior))
 
-        transport = tnet.TelegramFallbackTransport(["149.154.167.220", "149.154.167.221"])
+        # .167.220 is the demoted last-resort literal (seq13-followup) - use plain literals here so this
+        # test keeps exercising sticky semantics only.
+        transport = tnet.TelegramFallbackTransport(["149.154.167.221", "149.154.167.222"])
 
-        # First request: .220 works immediately (IPv4-first) → becomes sticky
+        # First request: .221 works immediately (IPv4-first) → becomes sticky
         await transport.handle_async_request(_telegram_request())
-        assert transport._sticky_ip == "149.154.167.220"
+        assert transport._sticky_ip == "149.154.167.221"
 
-        # Now .220 goes bad too
+        # Now .221 goes bad too
         calls.clear()
-        behavior["149.154.167.220"] = "timeout"
+        behavior["149.154.167.221"] = "timeout"
 
         resp = await transport.handle_async_request(_telegram_request())
         assert resp.status_code == 200
-        # Sticky .220 fails → remaining IPv4 .221 works. Hostname is last
+        # Sticky .221 fails → remaining IPv4 .222 works. Hostname is last
         # and is never needed.
-        assert [c["url_host"] for c in calls] == ["149.154.167.220", "149.154.167.221"]
-        assert transport._sticky_ip == "149.154.167.221"
+        assert [c["url_host"] for c in calls] == ["149.154.167.221", "149.154.167.222"]
+        assert transport._sticky_ip == "149.154.167.222"
 
     @pytest.mark.asyncio
     async def test_hostname_tried_last_when_ipv4_fails(self, monkeypatch):
@@ -564,6 +566,18 @@ class TestDiscoverFallbackIps:
         assert elapsed < 1.4, f"discovery gated on hung system DNS ({elapsed:.2f}s)"
 
 
+class TestSeq13FollowupMtProtoFilter:
+    """seq13-followup: MTProto-only DC addresses never reach the candidate list."""
+
+    def test_normalisation_drops_mtproto_only_dcs(self):
+        assert tnet._normalize_fallback_ips(
+            ["149.154.175.50", "91.108.56.130", "149.154.166.110"]) == ["149.154.166.110"]
+
+    def test_probe_list_excludes_mtproto_only_dcs(self, monkeypatch):
+        monkeypatch.setattr(tnet, "_probe_tls", lambda ip, timeout=tnet._TLS_PROBE_TIMEOUT: (True, ""))
+        assert tnet.probe_fallback_ips(["149.154.175.50", "149.154.166.110"]) == ["149.154.166.110"]
+
+
 class TestFailoverAcceleration:
     """seq13: a blackholed path must be tried after a freshly healthy one, and failure kinds
     are tallied for the one-line transport-health log."""
@@ -578,12 +592,24 @@ class TestFailoverAcceleration:
         return tnet.TelegramFallbackTransport(ips)
 
     def test_failed_path_is_deprioritised_next_walk(self, monkeypatch):
-        t = self._transport(monkeypatch, ["149.154.166.110", "149.154.167.220"])
-        # No history: config order preserved, hostname last.
-        assert t._attempt_order() == ["149.154.166.110", "149.154.167.220", None]
-        # .110 just failed → it must not lead the next walk.
+        t = self._transport(monkeypatch, ["149.154.166.110", "149.154.167.220", "149.154.169.51"])
+        # No history: config order preserved for peers, last-resort literal behind them, hostname last.
+        assert t._attempt_order() == ["149.154.166.110", "149.154.169.51", "149.154.167.220", None]
+        # .110 just failed → it must not lead the next walk (peers only; last-resort stays behind).
         t._path_failures["149.154.166.110"] = 1
-        assert t._attempt_order() == ["149.154.167.220", "149.154.166.110", None]
+        assert t._attempt_order() == ["149.154.169.51", "149.154.166.110", "149.154.167.220", None]
+
+    def test_last_resort_literal_is_demoted_even_when_sticky(self, monkeypatch):
+        """seq13-followup: the .167.220 system-DNS path that pinned the 2026-10-05 incident never leads."""
+        t = self._transport(monkeypatch, ["149.154.167.220", "149.154.166.110"])
+        assert t._attempt_order() == ["149.154.166.110", "149.154.167.220", None]
+        t._sticky_ip = "149.154.167.220"
+        assert t._attempt_order() == ["149.154.166.110", "149.154.167.220", None]
+
+    def test_mtproto_only_dc_never_becomes_a_candidate(self, monkeypatch):
+        """seq13-followup: MTProto-only DCs (WRONG_VERSION source) are dropped before any dial."""
+        t = self._transport(monkeypatch, ["149.154.175.50", "91.108.56.130", "149.154.166.110"])
+        assert t._attempt_order() == ["149.154.166.110", None]
 
     def test_sticky_path_still_leads(self, monkeypatch):
         t = self._transport(monkeypatch, ["149.154.166.110", "149.154.167.220"])

@@ -84,6 +84,19 @@ _DOH_PROVIDERS: list[dict] = [
 # Last-resort IPv4 Bot API endpoints (149.154.160.0/20). Used when DoH is blocked AND as
 # first-try connect targets so a blackholed IPv6 AAAA for the hostname can't pin initialize().
 SEED_FALLBACK_IPS: list[str] = ["149.154.166.110", "149.154.167.220"]
+# MTProto-only Telegram data-centre addresses: same Telegram-owned bands as the Bot API, they accept
+# TCP :443 but speak MTProto instead of Bot-API TLS, so every request routed to them dies with
+# SSL WRONG_VERSION_NUMBER. They leak into the candidate list through DoH A-records (Google/Cloudflare
+# answer api.telegram.org with DC addresses too): during the 2026-10-05 incident 149.154.175.50
+# (76 attempts) and 91.108.56.130 (70 attempts) accounted for every WRONG_VERSION error. Dropping them
+# before anything dials them only saves the wasted handshake - the TLS probe stays the authoritative
+# filter, because no hand-maintained list can be complete.
+_MT_PROTO_ONLY_IPS: frozenset[str] = frozenset({"149.154.175.50", "91.108.56.130"})
+# Demoted to the back of the candidate order. 149.154.167.220 is the system-DNS address the sticky path
+# pinned during the 2026-10-05/06 incident (3,777 attempts, sticky failures) while 149.154.166.110
+# served 8,942. It stays in the list as a last resort but never ahead of an equivalent literal, even
+# when it is the sticky pick.
+_LAST_RESORT_IPS: frozenset[str] = frozenset({"149.154.167.220"})
 # The Bot API is only served from Telegram-owned networks. Both discovery legs (system resolver and
 # DoH) must stay inside them: a hijacked/poisoned DNS answer or an unrelated A record that happens to
 # be returned for api.telegram.org must never become a connect target (#87015).
@@ -177,7 +190,10 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         # Deprioritise paths that failed on the previous walk (stable sort keeps config order for
         # ties) so a blackholed endpoint is tried after a freshly healthy one.
         tail = [ip for ip in order if ip is not None]
-        tail.sort(key=lambda ip: self._path_failures.get(ip, 0))
+        # Two keys, most significant first: last-resort literals always behind everything else (even
+        # when sticky selected one), then paths that failed on the previous walk (stable sort keeps
+        # config order for ties) so a blackholed endpoint is tried after a freshly healthy one.
+        tail.sort(key=lambda ip: (ip in _LAST_RESORT_IPS, self._path_failures.get(ip, 0)))
         order = [ip for ip in order if ip is None] + tail
         if None not in order:
             order.append(None)
@@ -278,6 +294,8 @@ def _normalize_fallback_ips(values: Iterable[str]) -> list[str]:
             logger.warning("Ignoring non-IPv4 Telegram fallback IP: %s", raw)
         elif addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_unspecified:
             logger.warning("Ignoring private/internal Telegram fallback IP: %s", raw)
+        elif str(addr) in _MT_PROTO_ONLY_IPS:
+            logger.warning("Ignoring MTProto-only Telegram DC (serves no Bot-API TLS): %s", raw)
         else:
             normalized.append(str(addr))
     return normalized
@@ -406,6 +424,8 @@ async def discover_fallback_ips() -> list[str]:
         if ip not in validated:
             logger.warning("Discarding out-of-band DoH answer for %s: %s", _TELEGRAM_API_HOST, ip)
     if validated:
+        # Last-resort literals discovered as A records go behind the rest of the answers (stable order).
+        validated.sort(key=lambda ip: ip in _LAST_RESORT_IPS)
         logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(validated))
         return validated
     logger.info(
