@@ -33,6 +33,16 @@ def test_entry_past_ttl_is_a_miss(monkeypatch):
     assert sc.get_cached_entry("srv", "fp") is None
 
 
+def test_zero_ttl_is_treated_as_no_ttl():
+    # Servers that omit SEP-2549 hints arrive as ttl_ms=0; it must NOT be
+    # persisted as a TTL, otherwise (age>=0) always expires and the manifest
+    # is re-probed on every discovery pass.
+    sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}], ttl_ms=0)
+    entry = sc.get_cached_entry("srv", "fp")
+    assert entry is not None
+    assert "ttl_ms" not in entry
+
+
 def test_ttl_rewrite_advances_written_at():
     sc.write_cache_entry("srv", "fp", tools=[{"name": "t"}], ttl_ms=60_000)
     first = sc.get_cached_entry("srv", "fp")["written_at"]

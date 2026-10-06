@@ -20,6 +20,36 @@ logger = logging.getLogger("tools.mcp_tool")
 _mcp_stderr_log_fh: Dict[str, Any] = {}  # profile home key -> handle
 _mcp_stderr_log_lock = threading.Lock()
 
+# Size cap for logs/mcp-stderr.log. The file is an append-only sink for child
+# stderr and is NOT handled by the stdlib _ManagedRotatingFileHandler (that only
+# covers agent/errors/gateway logs), so unbounded growth has to be capped here at
+# the collector. Default 5 MiB, 3 backups (.1/.2/.3), overridable via env.
+_MCP_STDERR_MAX_BYTES = int(os.environ.get("HERMES_MCP_STDERR_MAX_BYTES", str(5 * 1024 * 1024)))
+_MCP_STDERR_BACKUPS = int(os.environ.get("HERMES_MCP_STDERR_BACKUPS", "3"))
+
+
+def _rotate_mcp_stderr_log(path: Any) -> None:
+    """Shift ``mcp-stderr.log`` -> ``.1`` -> ``.2`` ... when it exceeds the cap.
+
+    Best-effort and safe to call on every open: a rotation failure must never stop
+    the log from being opened (children would then lose their stderr sink).
+    """
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) < _MCP_STDERR_MAX_BYTES:
+            return
+        stem = str(path)
+        oldest = f"{stem}.{_MCP_STDERR_BACKUPS}"
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(_MCP_STDERR_BACKUPS - 1, 0, -1):
+            src = f"{stem}.{i}"
+            if os.path.exists(src):
+                os.replace(src, f"{stem}.{i + 1}")
+        os.replace(path, f"{stem}.1")
+    except Exception as exc:  # pragma: no cover — best-effort
+        logger.debug("Failed to rotate MCP stderr log: %s", exc)
+
+
 
 def _get_mcp_stderr_log() -> Any:
     """Shared append-mode handle for MCP subprocess stderr, cached until shutdown PER PROFILE HOME (a
@@ -33,8 +63,10 @@ def _get_mcp_stderr_log() -> Any:
             try:
                 log_dir = get_hermes_home() / "logs"
                 mkdir_under_hermes_home(log_dir)
+                log_path = log_dir / "mcp-stderr.log"
+                _rotate_mcp_stderr_log(log_path)  # cap unbounded growth (no stdlib rotation here)
                 # Line-buffered so output lands promptly; errors="replace" tolerates garbled binary.
-                fh = open(log_dir / "mcp-stderr.log", "a", encoding="utf-8", errors="replace", buffering=1)
+                fh = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
                 fh.fileno()  # confirm a real fd before committing
             except Exception as exc:  # pragma: no cover — best-effort fallback
                 logger.debug("Failed to open MCP stderr log, using devnull: %s", exc)

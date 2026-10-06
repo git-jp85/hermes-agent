@@ -181,7 +181,8 @@ from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
-    SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
+    SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env,
+    probe_fallback_ips_async, tcp_keepalive_socket_options)
 from utils import env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -1197,6 +1198,28 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             configured = configured.split(",")
         return parse_fallback_ip_env(",".join(str(v) for v in configured) if configured else None)
 
+    def _extra_number(self, key: str, default: float) -> float:
+        """Return ``telegram.extra[key]`` coerced to float, else ``default``.
+
+        Adds config-file control on top of the existing env vars / constants; an unset or non-numeric
+        key leaves the caller's current default untouched, so behaviour with no override is identical.
+        """
+        extra = getattr(self.config, "extra", None)
+        if not isinstance(extra, dict) or key not in extra:
+            return default
+        raw = extra[key]
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            logger.warning("[%s] Ignoring non-numeric telegram.extra.%s=%r; using %r", self.name, key, raw, default)
+            return default
+
+    def _text_send_deadline_value(self) -> float:
+        """Effective per-send wall-clock cap: ``telegram.extra.send_deadline`` override, else the
+        module constant ``_TEXT_SEND_DEADLINE`` (read lazily so a monkeypatched constant still applies
+        when no config override is set)."""
+        return self._extra_number("send_deadline", _TEXT_SEND_DEADLINE)
+
     @staticmethod
     def _looks_like_polling_conflict(error: Exception) -> bool:
         text = str(error).lower()
@@ -1498,7 +1521,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             # fully model; a post-delivery parse error ≠ send failure.
             msg = await _await_with_thread_deadline(
                 self._bot.do_api_request("sendRichMessage", api_kwargs=payload),
-                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False)
         except Exception as exc:
             if self._rich_rejected(exc, "sendRichMessage", "MarkdownV2"):
                 return None
@@ -1544,7 +1567,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         try:
             await _await_with_thread_deadline(
                 self._bot.do_api_request("editMessageText", api_kwargs=payload),
-                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False)
         except Exception as exc:
             # "Message is not modified" = successful no-op; skip the redundant legacy edit.
             if "not modified" in str(exc).lower():
@@ -1575,7 +1598,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         try:
             return bool(await _await_with_thread_deadline(
                 self._bot.do_api_request("sendRichMessageDraft", api_kwargs=payload),
-                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
+                timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False))
         except Exception as exc:
             if self._is_rich_capability_error(exc):
                 self._rich_draft_disabled = True
@@ -2651,7 +2674,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                     await _await_with_thread_deadline(
                         self._bot.send_message(
                             chat_id=normalize_telegram_chat_id(chat_id), message_thread_id=thread_id, text=f"\U0001f4cc {topic_name}"),
-                        timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                        timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False)
                 except Exception as seed_err:
                     logger.debug("[%s] Could not send seed message to topic '%s': %s", self.name, topic_name, seed_err)
 
@@ -2930,9 +2953,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         request_kwargs = {
             "connection_pool_size": env_int("HERMES_TELEGRAM_HTTP_POOL_SIZE", 512),
             "pool_timeout": env_float("HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", 8.0),
-            "connect_timeout": env_float("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", 10.0),
-            "read_timeout": env_float("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", 20.0),
-            "write_timeout": env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
+            # connect/read/write timeouts: env vars keep working, and telegram.extra.{connect_timeout,
+            # read_timeout,write_timeout} now override them from config. Defaults are unchanged
+            # (10/20/20s), so a config without these keys behaves exactly as before.
+            "connect_timeout": self._extra_number("connect_timeout", env_float("HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", 10.0)),
+            "read_timeout": self._extra_number("read_timeout", env_float("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", 20.0)),
+            "write_timeout": self._extra_number("write_timeout", env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0)),
             # PTB routes file requests to media_write_timeout; httpx budgets it per socket write (stall
             # tolerance, not bandwidth), so 60s rides out congested-link buffer stalls.
             "media_write_timeout": 60.0,
@@ -2982,6 +3008,28 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 fallback_ips = list(SEED_FALLBACK_IPS)
             else:
                 logger.info("[%s] Auto-discovered Telegram fallback IPs: %s", self.name, ", ".join(fallback_ips))
+        if fallback_ips and not disable_fallback:
+            # Final judgement on fallback candidates: a cheap band check is not enough (MTProto-only DCs
+            # live inside the Telegram band and answer :443 with non-TLS bytes → SSL WRONG_VERSION), so
+            # each candidate must complete a real TCP+TLS handshake with SNI=api.telegram.org before use.
+            probe_timeout = self._env_float_clamped("HERMES_TELEGRAM_FALLBACK_PROBE_TIMEOUT", 5.0, min_value=0.0)
+            try:
+                probed = await _await_with_thread_deadline(
+                    probe_fallback_ips_async(fallback_ips),
+                    timeout=probe_timeout * max(len(fallback_ips), 1) + 1.0)
+            except Exception as exc:
+                logger.warning("[%s] Telegram fallback-IP TLS probe errored; keeping band-validated candidates: %s",
+                               self.name, _redact_telegram_error_text(exc))
+                probed = fallback_ips
+            if probed:
+                dropped = [ip for ip in fallback_ips if ip not in probed]
+                if dropped:
+                    logger.warning("[%s] Telegram fallback IPs excluded by TLS probe (no Bot-API TLS on :443): %s",
+                                   self.name, ", ".join(dropped))
+                fallback_ips = probed
+            else:
+                logger.warning("[%s] Telegram fallback-IP TLS probe excluded every candidate; "
+                               "keeping band-validated list as a safety net: %s", self.name, ", ".join(fallback_ips))
         proxy_url = resolve_proxy_url(
             "TELEGRAM_PROXY", target_hosts=["api.telegram.org", *fallback_ips],
             configured=self.config.extra.get("proxy_url"))
@@ -3465,13 +3513,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         try:
             return await _await_with_thread_deadline(
                 self._bot.send_message(text=chunk, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs),
-                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False)
         except Exception as md_error:
             if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                 return await _await_with_thread_deadline(
                     self._bot.send_message(text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs),
-                    timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                    timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False)
             raise
 
     async def _send_chunk_with_retries(
@@ -3804,7 +3852,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         if parse_mode is not None:
             kwargs["parse_mode"] = parse_mode
         await _await_with_thread_deadline(
-            self._bot.edit_message_text(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+            self._bot.edit_message_text(**kwargs), timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False)
 
     async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str) -> bool:
         """MarkdownV2 edit with plain-text fallback. Returns True on a "not modified" no-op (caller may
@@ -3976,7 +4024,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                     self._bot.send_message(
                     chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
                     reply_to_message_id=reply_to_id, **thread_kwargs, **base),
-                    timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                    timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False)
             except Exception as send_err:
                 if "reply message not found" in str(send_err).lower():
                     # Private DM topic fallback needs anchor + topic id together; forum topics keep thread id.
@@ -3988,7 +4036,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                             self._bot.send_message(
                             chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else chunk,
                             **retry_thread_kwargs, **base),
-                            timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                            timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False)
                     except Exception as _retry_err:
                         logger.warning(
                             "[%s] Overflow continuation no-reply retry failed: %s", self.name, _redact_telegram_error_text(_retry_err))
@@ -4099,7 +4147,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             kwargs.update(draft_thread_kwargs)
             try:
                 if await _await_with_thread_deadline(
-                    self._bot.send_message_draft(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False):
+                    self._bot.send_message_draft(**kwargs), timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False):
                     return SendResult(success=True, message_id=None)
                 return SendResult(success=False, error="draft_rejected")
             except Exception as e:
@@ -4127,7 +4175,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         message_thread_id = kwargs.get("message_thread_id")
         try:
             return await _await_with_thread_deadline(
-                self._bot.send_message(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                self._bot.send_message(**kwargs), timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False)
         except Exception as send_err:
             if (message_thread_id is not None and self._is_bad_request_error(send_err) and self._is_thread_not_found_error(send_err)):
                 logger.warning(
@@ -4137,7 +4185,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("message_thread_id", None)
                 return await _await_with_thread_deadline(
-                    self._bot.send_message(**retry_kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+                    self._bot.send_message(**retry_kwargs), timeout=self._text_send_deadline_value(), label="telegram-send", dump_on_blocked_loop=False)
             raise
 
     async def _send_control_message(
