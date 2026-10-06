@@ -17,7 +17,7 @@ def test_gateway_import_preserves_cwdless_tui_workspace(tmp_path, configured):
     cwd = launch.as_posix() if configured == "explicit" else configured
     (home / "config.yaml").write_text(f"terminal:\n  cwd: '{cwd}'\n", encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if k.upper() in {
-        "PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT",
+        "PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "HERMES_DISABLE_LAZY_INSTALLS",
     }}
     for key in ("HOME", "USERPROFILE", "HERMES_HOME", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"):
         env[key] = str(home)

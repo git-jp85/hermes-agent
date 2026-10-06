@@ -39,7 +39,7 @@ _PASSTHROUGH_ENV = frozenset({
     "WINDIR", "TEMP", "TMP", "OS", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
     "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData", "CommonProgramFiles",
     "CommonProgramFiles(x86)", "CommonProgramW6432", "USERNAME", "USERDOMAIN", "COMPUTERNAME",
-    "PSModulePath", "LANG", "TZ",
+    "PSModulePath", "LANG", "TZ", "HERMES_DISABLE_LAZY_INSTALLS",
 })
 _SECRET_SUFFIXES = ("_API_KEY", "_TOKEN", "_SECRET", "_ACCESS_KEY")
 

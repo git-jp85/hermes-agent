@@ -60,6 +60,9 @@ def _minimal_env(**extra) -> dict:
         "HOME": os.environ.get("HOME", ""),
         "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),  # Windows needs it
         "LOCALAPPDATA": os.environ.get("LOCALAPPDATA", ""),
+        # Suite-wide lazy-install kill-switch: a child with a fresh HERMES_HOME
+        # must not provision a runtime of its own (see tests/conftest.py).
+        "HERMES_DISABLE_LAZY_INSTALLS": os.environ.get("HERMES_DISABLE_LAZY_INSTALLS", ""),
     }
     env = {k: v for k, v in env.items() if v}
     env.update(extra)

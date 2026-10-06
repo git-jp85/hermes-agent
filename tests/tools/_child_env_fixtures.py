@@ -18,6 +18,7 @@ def child_env(monkeypatch, tmp_path):
     names = (
         "PATH", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT",
         "TEMP", "TMP", "OS", "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS",
+        "HERMES_DISABLE_LAZY_INSTALLS",
     )
     seed = {k: v for k, v in os.environ.items() if k.upper() in names}
     seed.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path), USER="env-test",

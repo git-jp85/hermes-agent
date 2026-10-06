@@ -482,7 +482,8 @@ def _serve(spool: Path) -> None:  # pragma: no cover - runs in the child process
 # Test-process side ----------------------------------------------------------------------------
 
 
-_KEEP_ENV = ("PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV", "SYSTEMROOT")
+_KEEP_ENV = ("PATH", "LANG", "LC_ALL", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV", "SYSTEMROOT",
+             "HERMES_DISABLE_LAZY_INSTALLS")
 
 
 class GatewayProcess:
