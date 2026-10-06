@@ -71,7 +71,8 @@ def _operator_home() -> str:
 
 def _minimal_env(home: Path, hermes_home: Path, token: str, extra: dict[str, str] | None) -> dict[str, str]:
     """A clean child env: nothing Hermes-, provider- or credential-shaped leaks in from the test runner."""
-    env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "TERM", "SYSTEMROOT") if k in os.environ}
+    env = {k: os.environ[k] for k in ("PATH", "LANG", "LC_ALL", "TERM", "SYSTEMROOT",
+                                      "HERMES_DISABLE_LAZY_INSTALLS") if k in os.environ}
     tmpdir = home.parent / "tmp"
     tmpdir.mkdir(parents=True, exist_ok=True)
     env.update(

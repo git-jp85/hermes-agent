@@ -71,6 +71,10 @@ def _run_gateway_import(
         "PATH",
         "PYTHONPATH",
         "VIRTUAL_ENV",
+        # The suite disables on-demand runtime provisioning; without this the
+        # child installs a whole runtime into its temp HERMES_HOME and the
+        # 60s timeout below trips.
+        "HERMES_DISABLE_LAZY_INSTALLS",
         "HOME",
         "USERPROFILE",
         "HOMEDRIVE",

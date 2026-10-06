@@ -8,7 +8,8 @@ import os
 from unittest.mock import patch
 
 import os as _os
-_SYS_ENV = {k: _os.environ[k] for k in ("SYSTEMROOT", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "HOME") if k in _os.environ}
+_SYS_ENV = {k: _os.environ[k] for k in ("SYSTEMROOT", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "HOME",
+                                         "HERMES_DISABLE_LAZY_INSTALLS") if k in _os.environ}
 
 
 # ---------------------------------------------------------------------------

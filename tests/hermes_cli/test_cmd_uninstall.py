@@ -49,6 +49,7 @@ def test_module_subprocess_removes_only_the_disposable_home(layout, tmp_path):
     root = Path(uninstall.__file__).resolve().parents[1]
     env = {key: value for key, value in os.environ.items() if key.upper() in {
         "PATH", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "TEMP", "TMP",
+        "HERMES_DISABLE_LAZY_INSTALLS",
     }}
     env.update(HERMES_HOME=str(home), HERMES_RUNTIME_DIR=str(home / "machine" / "tool-store"),
                HOME=str(tmp_path), USERPROFILE=str(tmp_path), APPDATA=str(tmp_path),
