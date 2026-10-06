@@ -78,7 +78,7 @@ def write_cache_entry(server_name: str, fingerprint: str, *, tools: List[dict],
     """Persist tool schemas after a successful live connect. ``ttl_ms`` / ``cache_scope`` are
     the server's ``tools/list`` SEP-2549 hints; ``written_at`` anchors TTL expiry."""
     entry = {"fingerprint": fingerprint, "tools": tools, "utility_tools": utility_tools or []}
-    if isinstance(ttl_ms, (int, float)):
+    if isinstance(ttl_ms, (int, float)) and ttl_ms > 0:
         entry["ttl_ms"] = ttl_ms
         entry["written_at"] = time.time()
     if cache_scope:

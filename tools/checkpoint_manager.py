@@ -155,6 +155,15 @@ DEFAULT_EXCLUDES = [
     "Thumbs.db",
     # Logs
     "*.log",
+    # Hermes runtime state. The checkpoint store must never snapshot itself
+    # (self-referential recursion), and profile-home sandboxes, bundled LSP
+    # servers and live SQLite files are volatile caches, not rollback targets.
+    "/checkpoints/",
+    "/home/",
+    "/lsp/",
+    "/state.db",
+    "/state.db-wal",
+    "/state.db-shm",
 ]
 
 # Git subprocess timeout (seconds).
