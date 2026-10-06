@@ -7,6 +7,7 @@ import asyncio
 import ipaddress
 import logging
 import socket
+import ssl
 from typing import Iterable, Optional
 
 import httpx
@@ -24,6 +25,30 @@ def _describe_transport_error(error: Exception) -> str:
         return redact_sensitive_text(repr(error), force=True)
     except Exception:
         return type(error).__name__
+
+
+def _classify_transport_error(error: Exception) -> str:
+    """Bucket a transport exception into a small, log-friendly kind label (seq13 observability)."""
+    if isinstance(
+        error,
+        (
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+            TimeoutError,
+            asyncio.TimeoutError,
+        ),
+    ):
+        return "timeout"
+    if isinstance(error, (httpx.ConnectError, ConnectionError)):
+        return "connect"
+    if isinstance(error, httpx.ReadError):
+        return "read"
+    text = str(error).lower()
+    if "wrong_version" in text or "ssl" in text:
+        return "tls"
+    return type(error).__name__
 
 # TCP keepalive so a half-open/CLOSE-WAIT long-poll errors out instead of blocking getUpdates forever
 # (Windows leaves SO_KEEPALIVE off). Idle/interval knobs are best-effort per Python/OS combo.
@@ -57,6 +82,13 @@ _DOH_PROVIDERS: list[dict] = [
 # Last-resort IPv4 Bot API endpoints (149.154.160.0/20). Used when DoH is blocked AND as
 # first-try connect targets so a blackholed IPv6 AAAA for the hostname can't pin initialize().
 SEED_FALLBACK_IPS: list[str] = ["149.154.166.110", "149.154.167.220"]
+# The Bot API is only served from Telegram-owned networks. Both discovery legs (system resolver and
+# DoH) must stay inside them: a hijacked/poisoned DNS answer or an unrelated A record that happens to
+# be returned for api.telegram.org must never become a connect target (#87015).
+_TELEGRAM_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
+    ipaddress.ip_network("149.154.160.0/20"),
+    ipaddress.ip_network("91.108.0.0/16"),
+)
 _UNSET = object()
 
 
@@ -91,6 +123,12 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         self._sticky_ip: object = _UNSET
         self._sticky_lock = asyncio.Lock()
         self._last_failure: tuple[str, str] | None = None
+        # Consecutive connect failures per path (key: IPv4 str or None=hostname). A path that failed
+        # on the previous walk is deprioritised so the transport stops re-hitting a blackholed
+        # endpoint ahead of a freshly healthy one (failover acceleration, seq13).
+        self._path_failures: dict[Optional[str], int] = {}
+        # Failure-kind counters for the one-line transport-health summary logged on recovery.
+        self._failure_kinds: dict[str, int] = {}
 
     async def _get_fallback(self, ip: str) -> httpx.AsyncHTTPTransport:
         async with self._fallback_lock:
@@ -134,9 +172,23 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         if self._sticky_ip is not _UNSET:
             order.append(None if self._sticky_ip is None else str(self._sticky_ip))
         order.extend(ip for ip in self._fallback_ips if ip not in order)
+        # Deprioritise paths that failed on the previous walk (stable sort keeps config order for
+        # ties) so a blackholed endpoint is tried after a freshly healthy one.
+        tail = [ip for ip in order if ip is not None]
+        tail.sort(key=lambda ip: self._path_failures.get(ip, 0))
+        order = [ip for ip in order if ip is None] + tail
         if None not in order:
             order.append(None)
         return order
+
+    def _failure_summary(self) -> str:
+        """Compact 'kind=count' tally of transport failures since start, for one-line health logs."""
+        if not self._failure_kinds:
+            return "none"
+        return ", ".join(
+            f"{kind}={count}"
+            for kind, count in sorted(self._failure_kinds.items(), key=lambda kv: -kv[1])
+        )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:
@@ -147,14 +199,18 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
             transport = self._primary if ip is None else await self._get_fallback(ip)
             try:
                 response = await transport.handle_async_request(candidate)
+                # Success clears this path's failure streak.
+                self._path_failures.pop(ip, None)
                 if self._last_failure is not None:
                     failed_path, failure = self._last_failure
                     self._last_failure = None
                     logger.info(
-                        "[Telegram] Telegram API transport recovered via %s after %s failed: %s",
+                        "[Telegram] Telegram API transport recovered via %s after %s failed: %s "
+                        "(transport failure tally: %s)",
                         ip or _TELEGRAM_API_HOST,
                         failed_path,
                         failure,
+                        self._failure_summary(),
                     )
                 if self._sticky_ip is _UNSET or self._sticky_ip != ip:
                     async with self._sticky_lock:
@@ -170,6 +226,10 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                     raise
                 path = ip or _TELEGRAM_API_HOST
                 failure = _describe_transport_error(exc)
+                self._failure_kinds[_classify_transport_error(exc)] = (
+                    self._failure_kinds.get(_classify_transport_error(exc), 0) + 1
+                )
+                self._path_failures[ip] = self._path_failures.get(ip, 0) + 1
                 self._last_failure = (path, failure)
                 if self._sticky_ip is not _UNSET and ip == self._sticky_ip:
                     async with self._sticky_lock:
@@ -221,6 +281,63 @@ def _normalize_fallback_ips(values: Iterable[str]) -> list[str]:
     return normalized
 
 
+def _in_telegram_band(ip: str) -> bool:
+    """True only when ``ip`` is an IPv4 literal inside a Telegram-owned network."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.version == 4 and any(addr in net for net in _TELEGRAM_NETWORKS)
+
+
+# Fallback candidates are only trusted after an actual TCP + TLS handshake against the IP with
+# SNI=api.telegram.org. The band filter (``_in_telegram_band``) is a cheap first pass, but it is not
+# sufficient: Telegram's MTProto-only DCs live inside the same 149.154.160.0/20 band
+# (e.g. 149.154.175.50) and accept a TCP connection on :443 while speaking MTProto, not Bot-API TLS
+# — a fallback to such an IP raises SSL WRONG_VERSION on every request. The handshake result is the
+# final judgement; failures are logged and dropped from the candidate list.
+_TLS_PROBE_TIMEOUT = 5.0
+_TLS_PROBE_PORT = 443
+
+
+def _probe_tls(ip: str, timeout: float = _TLS_PROBE_TIMEOUT) -> tuple[bool, str]:
+    """Return ``(ok, reason)`` for a TCP connect + TLS handshake to ``ip`` with SNI=api.telegram.org."""
+    context = ssl.create_default_context()
+    try:
+        with socket.create_connection((ip, _TLS_PROBE_PORT), timeout=timeout) as sock:
+            with context.wrap_socket(sock, server_hostname=_TELEGRAM_API_HOST):
+                return True, ""
+    except Exception as exc:
+        return False, _describe_transport_error(exc)
+
+
+def probe_fallback_ips(ips: Iterable[str], timeout: float = _TLS_PROBE_TIMEOUT) -> list[str]:
+    """Validate fallback candidates with one TLS handshake each; return only the ones that complete it.
+
+    Order is preserved. ``_in_telegram_band`` stays the first filter; the probe is the final judgement
+    (it rejects MTProto-only DC IPs that sit inside the band but speak no Bot-API TLS). Called once
+    when the candidate set is built / switches — never on the normal request path.
+    """
+    validated: list[str] = []
+    for ip in dict.fromkeys(_normalize_fallback_ips(ips)):
+        if not _in_telegram_band(ip):
+            logger.warning("Discarding out-of-band Telegram fallback IP before TLS probe: %s", ip)
+            continue
+        ok, reason = _probe_tls(ip, timeout=timeout)
+        if ok:
+            validated.append(ip)
+        else:
+            logger.warning(
+                "Telegram fallback IP %s failed TLS probe (SNI=%s) and was excluded: %s",
+                ip, _TELEGRAM_API_HOST, reason)
+    return validated
+
+
+async def probe_fallback_ips_async(ips: Iterable[str], timeout: float = _TLS_PROBE_TIMEOUT) -> list[str]:
+    """Thread-offloaded :func:`probe_fallback_ips` so the blocking handshake never stalls the loop."""
+    return await asyncio.to_thread(probe_fallback_ips, list(ips), timeout)
+
+
 def parse_fallback_ip_env(value: str | None) -> list[str]:
     return _normalize_fallback_ips(part.strip() for part in value.split(",")) if value else []
 
@@ -229,7 +346,7 @@ def _resolve_system_dns() -> set[str]:
     """Return the IPv4 addresses that the OS resolver gives for api.telegram.org."""
     try:
         results = socket.getaddrinfo(_TELEGRAM_API_HOST, 443, socket.AF_INET)
-        return {addr[4][0] for addr in results}
+        return {str(addr[4][0]) for addr in results if _in_telegram_band(str(addr[4][0]))}
     except Exception:
         return set()
 
@@ -281,7 +398,11 @@ async def discover_fallback_ips() -> list[str]:
     except Exception:
         logger.debug("System-DNS resolution for %s did not complete in time", _TELEGRAM_API_HOST)
     doh_ips = [ip for r in results if isinstance(r, list) for ip in r]
-    validated = _normalize_fallback_ips(list(dict.fromkeys(doh_ips)))  # dedupe, keep order
+    deduped = _normalize_fallback_ips(list(dict.fromkeys(doh_ips)))  # dedupe, keep order
+    validated = [ip for ip in deduped if _in_telegram_band(ip)]
+    for ip in deduped:
+        if ip not in validated:
+            logger.warning("Discarding out-of-band DoH answer for %s: %s", _TELEGRAM_API_HOST, ip)
     if validated:
         logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(validated))
         return validated

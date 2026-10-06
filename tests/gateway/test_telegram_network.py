@@ -82,6 +82,66 @@ class TestParseFallbackIpEnv:
     def test_none_returns_empty(self):
         assert tnet.parse_fallback_ip_env(None) == []
 
+
+class TestTelegramBandValidation:
+    """Only Telegram-owned ranges may become connect targets (#87015)."""
+
+    def test_in_band_true(self):
+        assert tnet._in_telegram_band("149.154.166.110")
+        assert tnet._in_telegram_band("91.108.56.130")
+
+    def test_forged_out_of_band_false(self):
+        # Ranges actually seen from a poisoned ISP resolver (Twitter/Facebook/CDN).
+        for ip in ("199.59.148.6", "31.13.95.38", "122.10.85.4", "8.8.8.8"):
+            assert not tnet._in_telegram_band(ip)
+
+    def test_invalid_and_ipv6_false(self):
+        assert not tnet._in_telegram_band("not-an-ip")
+        assert not tnet._in_telegram_band("2001:67c:4e8:f004::9")
+
+
+class TestFallbackTlsProbe:
+    """Fallback candidates must complete a real TCP+TLS handshake before use (#87015 follow-up).
+
+    The band check alone lets MTProto-only DC IPs through (they live inside 149.154.160.0/20 and
+    accept :443 with MTProto bytes → SSL WRONG_VERSION on every fallback request).
+    """
+
+    def test_keeps_only_handshake_successes(self, monkeypatch):
+        good, mtproto = "149.154.166.110", "149.154.175.50"
+        monkeypatch.setattr(tnet, "_probe_tls", lambda ip, timeout=5.0: (ip == good, "" if ip == good else "ssl wrong version"))
+        assert tnet.probe_fallback_ips([good, mtproto]) == [good]
+
+    def test_drops_out_of_band_before_probing(self, monkeypatch):
+        calls = []
+
+        def _fake(ip, timeout=5.0):
+            calls.append(ip)
+            return True, ""
+
+        monkeypatch.setattr(tnet, "_probe_tls", _fake)
+        assert tnet.probe_fallback_ips(["8.8.8.8", "149.154.166.110"]) == ["149.154.166.110"]
+        assert calls == ["149.154.166.110"]  # out-of-band never reaches the socket
+
+    def test_all_fail_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(tnet, "_probe_tls", lambda ip, timeout=5.0: (False, "timeout"))
+        assert tnet.probe_fallback_ips(["149.154.166.110", "149.154.167.220"]) == []
+
+    def test_preserves_order_and_dedupes(self, monkeypatch):
+        monkeypatch.setattr(tnet, "_probe_tls", lambda ip, timeout=5.0: (True, ""))
+        assert tnet.probe_fallback_ips(["149.154.166.110", "149.154.167.220", "149.154.166.110"]) == [
+            "149.154.166.110", "149.154.167.220"]
+
+    @pytest.mark.asyncio
+    async def test_async_wrapper_offloads(self, monkeypatch):
+        monkeypatch.setattr(tnet, "probe_fallback_ips", lambda ips, timeout=5.0: ["149.154.166.110"])
+        assert await tnet.probe_fallback_ips_async(["149.154.166.110"]) == ["149.154.166.110"]
+
+    def test_real_handshake_against_closed_port_fails(self):
+        # Deterministic: RFC 5737 TEST-NET-1 has no listener, so the real probe must fail (no monkeypatch).
+        ok, reason = tnet._probe_tls("192.0.2.1", timeout=0.5)
+        assert ok is False and reason
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Request rewriting
 # ═══════════════════════════════════════════════════════════════════════════
@@ -455,6 +515,29 @@ class TestDiscoverFallbackIps:
         assert ips == ["149.154.166.110"]
 
     @pytest.mark.asyncio
+    async def test_forged_out_of_band_doh_ips_discarded(self, monkeypatch):
+        """A poisoned resolver returning non-Telegram ranges must never become a
+        connect target: both discovery legs stay inside Telegram-owned networks."""
+        self._patch_doh(monkeypatch, {
+            "https://dns.google": (200, _doh_answer("199.59.148.6", "149.154.167.220")),
+            "https://cloudflare-dns.com": (200, _doh_answer("31.13.95.38")),
+        }, system_dns_ips=["122.10.85.4"])
+
+        ips = await tnet.discover_fallback_ips()
+        assert ips == ["149.154.167.220"]
+
+    @pytest.mark.asyncio
+    async def test_all_forged_doh_ips_fall_back_to_seeds(self, monkeypatch):
+        """When every resolver answer is out-of-band, use the known-good seed list."""
+        self._patch_doh(monkeypatch, {
+            "https://dns.google": (200, _doh_answer("199.59.148.6")),
+            "https://cloudflare-dns.com": (200, _doh_answer("202.160.128.40")),
+        }, system_dns_ips=["67.228.235.93"])
+
+        ips = await tnet.discover_fallback_ips()
+        assert ips == tnet.SEED_FALLBACK_IPS
+
+    @pytest.mark.asyncio
     async def test_hung_system_dns_does_not_gate_doh_results(self, monkeypatch):
         """#63309: socket.getaddrinfo has no timeout of its own — a wedged OS
         resolver must not stall discovery. DoH answers must come back promptly
@@ -479,3 +562,41 @@ class TestDiscoverFallbackIps:
 
         assert ips == ["149.154.167.220"]
         assert elapsed < 1.4, f"discovery gated on hung system DNS ({elapsed:.2f}s)"
+
+
+class TestFailoverAcceleration:
+    """seq13: a blackholed path must be tried after a freshly healthy one, and failure kinds
+    are tallied for the one-line transport-health log."""
+
+    def _transport(self, monkeypatch, ips):
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", lambda **kw: FakeTransport([], {}))
+        for key in (
+            "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy",
+            "all_proxy", "TELEGRAM_PROXY", "NO_PROXY", "no_proxy",
+        ):
+            monkeypatch.delenv(key, raising=False)
+        return tnet.TelegramFallbackTransport(ips)
+
+    def test_failed_path_is_deprioritised_next_walk(self, monkeypatch):
+        t = self._transport(monkeypatch, ["149.154.166.110", "149.154.167.220"])
+        # No history: config order preserved, hostname last.
+        assert t._attempt_order() == ["149.154.166.110", "149.154.167.220", None]
+        # .110 just failed → it must not lead the next walk.
+        t._path_failures["149.154.166.110"] = 1
+        assert t._attempt_order() == ["149.154.167.220", "149.154.166.110", None]
+
+    def test_sticky_path_still_leads(self, monkeypatch):
+        t = self._transport(monkeypatch, ["149.154.166.110", "149.154.167.220"])
+        t._sticky_ip = "149.154.166.110"
+        assert t._attempt_order()[0] == "149.154.166.110"
+
+    def test_failure_kinds_classified(self):
+        assert tnet._classify_transport_error(httpx.ConnectTimeout("x")) == "timeout"
+        assert tnet._classify_transport_error(httpx.ConnectError("x")) == "connect"
+        assert tnet._classify_transport_error(tnet.ssl.SSLError("WRONG_VERSION_NUMBER")) == "tls"
+
+    def test_failure_summary_empty_and_sorted(self, monkeypatch):
+        t = self._transport(monkeypatch, ["149.154.166.110"])
+        assert t._failure_summary() == "none"
+        t._failure_kinds.update({"connect": 2, "timeout": 5})
+        assert t._failure_summary() == "timeout=5, connect=2"
