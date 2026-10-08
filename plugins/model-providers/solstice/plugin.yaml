@@ -1,5 +1,9 @@
 name: solstice-provider
 kind: model-provider
+# httpx is an optional dependency: the plugin is simply unavailable in a runtime
+# that lacks it (the minimal PM runtime venv), which is not an error there.
+python_dependencies:
+  - httpx
 version: 0.1.0
 description: Solstice (per-user-quota OAuth, pre-release)
 author: Nous Research

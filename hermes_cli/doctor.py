@@ -58,6 +58,7 @@ from hermes_cli.doctor_state import (
     _check_skills_hub,
     _check_state_db,
 )
+from hermes_cli.doctor_providers import _check_provider_runtimes
 
 _PROVIDER_ENV_HINTS = (
     "DEEPINFRA_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
@@ -113,6 +114,7 @@ DOCTOR_CHECKS = (
     ('Security Advisories', _check_security_advisories), ('MCP Server Security', _check_mcp_security),
     ('Python Environment', _check_python_environment), ('SSL / CA Certificates', _check_certificates),
     ('Required Packages', _check_required_packages), (None, _check_web_dashboard_import),
+    ('Model Provider Runtimes', _check_provider_runtimes),
     ('Configuration Files', _check_env_file),
     (None, _check_config_file), (None, _check_config_drift),
     ('xAI Model Retirement (May 15, 2026)', _check_xai_retirement),

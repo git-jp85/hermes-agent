@@ -424,6 +424,88 @@ def _declares_model_provider_kind(plugin_dir: Path) -> bool:
     return False
 
 
+def _declared_python_dependencies(plugin_dir: Path) -> list[str] | None:
+    """``python_dependencies`` declared by ``plugin_dir``'s manifest, or None.
+
+    ``None`` means "not declared" (the manifest should say so explicitly — see
+    ``plugins/model-providers/*/plugin.yaml``); an empty list is impossible here
+    because a declaration that yields nothing is treated as absent.
+    """
+    for filename in ("plugin.yaml", "plugin.yml"):
+        manifest = plugin_dir / filename
+        if not manifest.is_file():
+            continue
+        try:
+            text = manifest.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        data = None
+        try:
+            from utils import fast_safe_load
+
+            data = fast_safe_load(text)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            declared = data.get("python_dependencies")
+        else:
+            # YAML parse unavailable: read the key back by hand, inline or block list.
+            declared = None
+            lines = text.splitlines()
+            for index, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped.startswith("python_dependencies:"):
+                    continue
+                inline = stripped.partition(":")[2].strip()
+                if inline:
+                    declared = inline
+                else:
+                    block = []
+                    for following in lines[index + 1:]:
+                        item = following.strip()
+                        if item.startswith("- "):
+                            block.append(item[2:].strip())
+                        elif item and not item.startswith("#"):
+                            break
+                    declared = block or None
+                break
+        if isinstance(declared, str):
+            declared = declared.strip().strip("[]").replace(" ", ",").split(",")
+        if not isinstance(declared, (list, tuple)):
+            return None
+        names = [str(item).strip().strip("\"'") for item in declared if str(item).strip()]
+        return names or None
+    return None
+
+
+def _declared_dependency_missing(plugin_dir: Path) -> str:
+    """Name of a declared-but-uninstallable dependency of *plugin_dir*, or "".
+
+    Only the *distribution* name's importability is probed, never the plugin's
+    code: a model-provider plugin whose declared dependency is absent from this
+    interpreter is legitimately unavailable here (the minimal PM runtime venv
+    carries no HTTP client at all), so it is skipped without importing it and
+    without a warning.
+    """
+    declared = _declared_python_dependencies(plugin_dir)
+    if not declared:
+        return ""
+    for spec in declared:
+        module = spec.strip()
+        for separator in ("==", ">=", "<=", "~=", ">", "<", "[", ";"):
+            module = module.split(separator, 1)[0]
+        module = module.strip().replace("-", "_")
+        if not module or module in _LOCAL_ROOTS:
+            continue
+        try:
+            available = importlib.util.find_spec(module) is not None
+        except Exception:
+            available = False
+        if not available:
+            return spec.strip()
+    return ""
+
+
 def _scan_home_layer(layer: _HomeLayer, key: str) -> None:
     """Import the bound home's not-yet-imported provider plugins into *layer*.
 
@@ -481,6 +563,14 @@ def _import_plugin_dir(plugin_dir: Path, source: str, *, home_key: str = "") -> 
             finally:
                 _current_source = None
             return
+
+    declared_missing = _declared_dependency_missing(plugin_dir)
+    if declared_missing:
+        logger.debug(
+            "%s provider plugin %s unavailable in this runtime: declared dependency %s is not installed",
+            source, plugin_dir.name, declared_missing,
+        )
+        return
 
     # Give bundled plugins a stable import path (``plugins.model_providers.<name>``)
     # so relative imports within the plugin work. User plugins load via

@@ -35,6 +35,53 @@ def _read_controls(messages, pause, fd):
         messages.put(None)
 
 
+class _PrefixedStderr:
+    """stderr proxy that tags each line with the worker's label.
+
+    ``main()`` points fd 1 at stderr so the PM protocol keeps the pipe; without a
+    tag a worker's own log lines (provider discovery, subprocess chatter) land in
+    the parent's log stream indistinguishable from the parent's own. Callers that
+    know the job set ``HERMES_WORKER_LABEL``; unlabelled workers keep the raw
+    stream. Bytes written by C extensions or the interpreter itself bypass this
+    proxy — it only makes Python-level writes attributable.
+    """
+
+    def __init__(self, stream, prefix: str) -> None:
+        self._stream = stream
+        self._prefix = prefix
+        self._pending = True
+
+    def write(self, text: str) -> int:
+        try:
+            if not text:
+                return 0
+            prefix = self._prefix
+            pieces = []
+            for index, chunk in enumerate(text.split("\n")):
+                if index:
+                    pieces.append("\n")
+                    self._pending = True
+                if not chunk:
+                    continue
+                if self._pending:
+                    pieces.append(prefix)
+                    self._pending = False
+                pieces.append(chunk)
+            self._stream.write("".join(pieces))
+            return len(text)
+        except Exception:
+            return len(text)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def main():
     import truststore
 
@@ -42,6 +89,9 @@ def main():
     # Capture the protocol FD before redirecting even native/subprocess stdout.
     wire = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    label = os.environ.get("HERMES_WORKER_LABEL", "").strip()
+    if label:
+        sys.stderr = _PrefixedStderr(sys.stderr, f"[{label}] ")
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     # A pending read on inherited control stdin can block child Python startup
     # on Windows. Keep the protocol private and give every ordinary child EOF.

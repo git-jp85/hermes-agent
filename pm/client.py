@@ -108,6 +108,8 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
     }
     worker = Path(__file__).with_name("worker.py").resolve()
     environment = runtime_environment()
+    # Tag this worker's own stderr lines so they stay attributable in the parent's log.
+    environment["HERMES_WORKER_LABEL"] = f"pm:{operation}:{request_id[:8]}"
     command = _worker_command(spec, arguments, worker, environment)
     callback_error = None
     stopped = threading.Event()
