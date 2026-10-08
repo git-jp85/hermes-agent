@@ -51,6 +51,14 @@ from providers.base import ProviderProfile
 
 logger = logging.getLogger(__name__)
 
+# Top-level module names that live inside this checkout. A missing one of these
+# means a genuinely broken bundled plugin import (stays a warning); a missing
+# *external* name (e.g. httpx in a minimal runtime venv) just means the plugin is
+# unavailable in this interpreter and is reported at debug level instead.
+_LOCAL_ROOTS = frozenset(
+    {"providers", "agent", "hermes_cli", "tools", "pm", "plugins"}
+)
+
 # Process-wide layer: bundled plugins, pip entry points, legacy ``providers/<name>.py``.
 _REGISTRY: dict[str, ProviderProfile] = {}
 _ALIASES: dict[str, str] = {}
@@ -497,9 +505,23 @@ def _import_plugin_dir(plugin_dir: Path, source: str, *, home_key: str = "") -> 
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
     except Exception as exc:
-        logger.warning(
-            "Failed to load %s provider plugin %s: %s", source, plugin_dir.name, exc
+        # A plugin whose *external* optional dependency is absent from this
+        # interpreter (e.g. httpx in the minimal pm-runtime venv) is simply not
+        # available here; that is expected, and it must not emit a warning from
+        # every short-lived isolated process. In-tree import breakage stays loud.
+        missing = getattr(exc, "name", "") or ""
+        external_missing = isinstance(exc, ModuleNotFoundError) and (
+            missing.split(".")[0] not in _LOCAL_ROOTS
         )
+        if external_missing:
+            logger.debug(
+                "%s provider plugin %s unavailable in this runtime: %s",
+                source, plugin_dir.name, exc,
+            )
+        else:
+            logger.warning(
+                "Failed to load %s provider plugin %s: %s", source, plugin_dir.name, exc
+            )
         sys.modules.pop(module_name, None)
     finally:
         _current_source = None
